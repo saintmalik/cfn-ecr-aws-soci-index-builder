@@ -18,9 +18,9 @@ import (
 	"oras.land/oras-go/v2/registry/remote"
 	"oras.land/oras-go/v2/registry/remote/auth"
 
-	"github.com/aws/aws-sdk-go/aws" //nolint:staticcheck
-	"github.com/aws/aws-sdk-go/aws/session" //nolint:staticcheck
-	"github.com/aws/aws-sdk-go/service/ecr" //nolint:staticcheck
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/awslabs/soci-snapshotter/soci/store"
 	"github.com/containerd/containerd/images"
 
@@ -232,24 +232,27 @@ func isEcrRegistry(registryUrl string) bool {
 
 // Authorize ECR registry
 func authorizeEcr(ecrRegistry *remote.Registry) error {
-	// getting ecr auth token
-	input := &ecr.GetAuthorizationTokenInput{}
-	var ecrClient *ecr.ECR
-	ecrEndpoint := os.Getenv("ECR_ENDPOINT") // set this env var for custom, i.e. non default, aws ecr endpoint
-	if ecrEndpoint != "" {
-		sess, err := session.NewSession(&aws.Config{Endpoint: aws.String(ecrEndpoint)})
-		if err != nil {
-			return err
-		}
-		ecrClient = ecr.New(sess)
-	} else {
-		sess, err := session.NewSession()
-		if err != nil {
-			return err
-		}
-		ecrClient = ecr.New(sess)
+	ctx := context.Background()
+	var cfg aws.Config
+	var err error	
+	cfg, err = config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
-	getAuthorizationTokenResponse, err := ecrClient.GetAuthorizationToken(input)
+
+	ecrEndpoint := os.Getenv("ECR_ENDPOINT") // set this env var for custom, i.e. non default, aws ecr endpoint
+
+	var ecrClient *ecr.Client
+	if ecrEndpoint != "" {
+		ecrClient = ecr.NewFromConfig(cfg, func(o *ecr.Options) {
+			o.BaseEndpoint = aws.String(ecrEndpoint)
+		})
+	} else {
+		ecrClient = ecr.NewFromConfig(cfg)
+	}
+
+	input := &ecr.GetAuthorizationTokenInput{}
+	getAuthorizationTokenResponse, err := ecrClient.GetAuthorizationToken(ctx, input)
 	if err != nil {
 		return err
 	}
@@ -259,7 +262,7 @@ func authorizeEcr(ecrRegistry *remote.Registry) error {
 	}
 
 	ecrAuthorizationToken := getAuthorizationTokenResponse.AuthorizationData[0].AuthorizationToken
-	if len(*ecrAuthorizationToken) == 0 {
+	if ecrAuthorizationToken == nil || len(*ecrAuthorizationToken) == 0 {
 		return errors.New("couldn't authorize with ECR: empty authorization token returned")
 	}
 
