@@ -21,17 +21,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"time"
 
 	"github.com/awslabs/soci-snapshotter/config"
 	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/content"
 	"github.com/containerd/containerd/defaults"
-	"github.com/containerd/errdefs"
+	"github.com/containerd/containerd/errdefs"
+	"github.com/containerd/containerd/namespaces"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"oras.land/oras-go/v2/content/oci"
+	"oras.land/oras-go/v2/errdef"
 )
 
 // BasicStore describes the functionality common to oras-go oci.Store, oras-go memory.Store, and containerd ContentStore.
@@ -73,57 +74,11 @@ const (
 	DefaultSociContentStorePath = "/var/lib/soci-snapshotter-grpc/content"
 )
 
-func ErrUnknownContentStoreType(contentStoreType ContentStoreType) error {
-	return fmt.Errorf("unknown content store type: %s; must be one of %v",
-		contentStoreType, ContentStoreTypes())
-}
-
-func ErrCouldNotCreateClient(address string) error {
-	return fmt.Errorf("could not create containerd client at %s", address)
-}
-
-// This struct allows SOCI to create a connection to the containerd on-demand
-// instead of on startup, allowing the daemon to start without containerd
-type ContainerdClient struct {
-	containerdAddress string
-	ctdClient         *containerd.Client
-	ctdClientLock     *sync.Mutex
-}
-
-func NewContainerdClient(containerdAddress string) *ContainerdClient {
-	return &ContainerdClient{
-		containerdAddress: containerdAddress,
-		ctdClientLock:     &sync.Mutex{},
-	}
-}
-
-func (c *ContainerdClient) Client() (*containerd.Client, error) {
-	if c.ctdClient != nil {
-		return c.ctdClient, nil
-	}
-	c.ctdClientLock.Lock()
-	defer c.ctdClientLock.Unlock()
-	if c.ctdClient == nil {
-		var err error
-		c.ctdClient, err = containerd.New(c.containerdAddress)
-		if err != nil {
-			return nil, ErrCouldNotCreateClient(c.containerdAddress)
-		}
-	}
-	return c.ctdClient, nil
-}
-
-type ContentStoreConfig struct {
-	config.ContentStoreConfig
-	ctdClient *ContainerdClient
-}
-
-func NewStoreConfig(opts ...Option) ContentStoreConfig {
-	storeConfig := ContentStoreConfig{
-		ContentStoreConfig: config.ContentStoreConfig{
-			Type:              config.DefaultContentStoreType,
-			ContainerdAddress: defaults.DefaultAddress,
-		},
+func NewStoreConfig(opts ...Option) config.ContentStoreConfig {
+	storeConfig := config.ContentStoreConfig{
+		Type:              config.DefaultContentStoreType,
+		Namespace:         namespaces.Default,
+		ContainerdAddress: defaults.DefaultAddress,
 	}
 	for _, o := range opts {
 		o(&storeConfig)
@@ -131,25 +86,29 @@ func NewStoreConfig(opts ...Option) ContentStoreConfig {
 	return storeConfig
 }
 
-type Option func(*ContentStoreConfig)
+type Option func(*config.ContentStoreConfig)
+
+func WithNamespace(namespace string) Option {
+	return func(sc *config.ContentStoreConfig) {
+		sc.Namespace = namespace
+	}
+}
 
 func WithType(contentStoreType ContentStoreType) Option {
-	return func(sc *ContentStoreConfig) {
+	return func(sc *config.ContentStoreConfig) {
 		sc.Type = contentStoreType
 	}
 }
 
-// This func will trim the leading 'unix://' if it is provided
 func WithContainerdAddress(address string) Option {
-	return func(sc *ContentStoreConfig) {
-		sc.ContainerdAddress = config.TrimSocketAddress(address)
+	return func(sc *config.ContentStoreConfig) {
+		sc.ContainerdAddress = address
 	}
 }
 
-func WithClient(client *ContainerdClient) Option {
-	return func(sc *ContentStoreConfig) {
-		sc.ctdClient = client
-	}
+func ErrUnknownContentStoreType(contentStoreType ContentStoreType) error {
+	return fmt.Errorf("unknown content store type: %s; must be one of %s or %s",
+		contentStoreType, ContainerdContentStoreType, SociContentStoreType)
 }
 
 // CanonicalizeContentStoreType resolves the empty string to DefaultContentStoreType,
@@ -182,22 +141,22 @@ func GetContentStorePath(contentStoreType ContentStoreType) (string, error) {
 
 type CleanupFunc func(context.Context) error
 
-func NopCleanup(context.Context) error { return nil }
+func nopCleanup(context.Context) error { return nil }
 
-func NewContentStore(opts ...Option) (Store, error) {
+func NewContentStore(ctx context.Context, opts ...Option) (context.Context, Store, error) {
 	storeConfig := NewStoreConfig(opts...)
 
 	contentStoreType, err := CanonicalizeContentStoreType(storeConfig.Type)
 	if err != nil {
-		return nil, err
+		return ctx, nil, err
 	}
 	switch contentStoreType {
 	case ContainerdContentStoreType:
-		return NewContainerdStore(storeConfig)
+		return NewContainerdStore(ctx, storeConfig)
 	case SociContentStoreType:
-		return NewSociStore()
+		return NewSociStore(ctx)
 	}
-	return nil, errors.New("unexpectedly reached end of NewContentStore")
+	return ctx, nil, errors.New("unexpectedly reached end of NewContentStore")
 }
 
 // SociStore wraps oci.Store and adds or stubs additional functionality of the Store interface.
@@ -209,9 +168,9 @@ type SociStore struct {
 var _ Store = (*SociStore)(nil)
 
 // NewSociStore creates a sociStore.
-func NewSociStore() (*SociStore, error) {
+func NewSociStore(ctx context.Context) (context.Context, *SociStore, error) {
 	store, err := oci.New(DefaultSociContentStorePath)
-	return &SociStore{store}, err
+	return ctx, &SociStore{store}, err
 }
 
 // Label is a no-op for sociStore until sociStore and ArtifactsDb are better integrated.
@@ -226,36 +185,39 @@ func (s *SociStore) Delete(_ context.Context, _ digest.Digest) error {
 
 // BatchOpen is a no-op for sociStore; it does not support batching operations.
 func (s *SociStore) BatchOpen(ctx context.Context) (context.Context, CleanupFunc, error) {
-	return ctx, NopCleanup, nil
+	return ctx, nopCleanup, nil
 }
 
 type ContainerdStore struct {
-	ContentStoreConfig
+	config.ContentStoreConfig
+	client *containerd.Client
 }
 
 // assert that ContainerdStore implements Store
 var _ Store = (*ContainerdStore)(nil)
 
-func NewContainerdStore(storeConfig ContentStoreConfig) (*ContainerdStore, error) {
+func NewContainerdStore(ctx context.Context, storeConfig config.ContentStoreConfig) (context.Context, *ContainerdStore, error) {
+	client, err := containerd.New(storeConfig.ContainerdAddress)
+	if err != nil {
+		return ctx, nil, fmt.Errorf("could not connect to containerd socket for content store access: %w", err)
+	}
+
+	ctx = namespaces.WithNamespace(ctx, storeConfig.Namespace)
+
 	containerdStore := ContainerdStore{
-		ContentStoreConfig: storeConfig,
+		client: client,
 	}
 
-	if containerdStore.ctdClient == nil {
-		containerdStore.ctdClient = NewContainerdClient(containerdStore.ContainerdAddress)
-	}
+	containerdStore.ContentStoreConfig = storeConfig
 
-	return &containerdStore, nil
+	return ctx, &containerdStore, nil
 }
 
 // Exists returns true iff the described content exists.
 func (s *ContainerdStore) Exists(ctx context.Context, target ocispec.Descriptor) (bool, error) {
-	client, err := s.client()
-	if err != nil {
-		return false, err
-	}
-	cs := client.ContentStore()
-	_, err = cs.Info(ctx, target.Digest)
+	ctx = namespaces.WithNamespace(ctx, s.Namespace)
+	cs := s.client.ContentStore()
+	_, err := cs.Info(ctx, target.Digest)
 	if errors.Is(err, errdefs.ErrNotFound) {
 		return false, nil
 	}
@@ -272,11 +234,8 @@ type sectionReaderAt struct {
 
 // Fetch fetches the content identified by the descriptor.
 func (s *ContainerdStore) Fetch(ctx context.Context, target ocispec.Descriptor) (io.ReadCloser, error) {
-	client, err := s.client()
-	if err != nil {
-		return nil, err
-	}
-	cs := client.ContentStore()
+	ctx = namespaces.WithNamespace(ctx, s.Namespace)
+	cs := s.client.ContentStore()
 	ra, err := cs.ReaderAt(ctx, target)
 	if err != nil {
 		return nil, err
@@ -287,28 +246,26 @@ func (s *ContainerdStore) Fetch(ctx context.Context, target ocispec.Descriptor) 
 // Push pushes the content, matching the expected descriptor.
 // This should be done within a Batch and followed by Label calls to prevent garbage collection.
 func (s *ContainerdStore) Push(ctx context.Context, expected ocispec.Descriptor, reader io.Reader) error {
+	ctx = namespaces.WithNamespace(ctx, s.Namespace)
 	exists, err := s.Exists(ctx, expected)
 	if err != nil {
 		return err
 	}
 	if exists {
-		// To be consistent with content.Copy, return nil if content already exists.
-		return nil
+		// error format based on oras.land/oras-go/v2/content/oci.Storage.Push()
+		return fmt.Errorf("%s: %s: %w", expected.Digest, expected.MediaType, errdef.ErrAlreadyExists)
 	}
 
-	client, err := s.client()
-	if err != nil {
-		return err
-	}
-	writer, err := content.OpenWriter(ctx, client.ContentStore(), content.WithRef(expected.Digest.String()))
-	if err != nil {
-		return err
-	}
-	defer writer.Close()
+	cs := s.client.ContentStore()
 
 	// gRPC message size limit includes some overhead that cannot be calculated from here
 	buf := make([]byte, defaults.DefaultMaxRecvMsgSize/2)
 	totalWritten := 0
+	writer, err := cs.Writer(ctx, content.WithRef(expected.Digest.String()))
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
 
 	for {
 		n, err := reader.Read(buf)
@@ -353,17 +310,14 @@ func LabelGCRefContent(ctx context.Context, store Store, target ocispec.Descript
 
 // Label creates or updates the named label with the given value.
 func (s *ContainerdStore) Label(ctx context.Context, target ocispec.Descriptor, name string, value string) error {
-	client, err := s.client()
-	if err != nil {
-		return err
-	}
-	cs := client.ContentStore()
+	ctx = namespaces.WithNamespace(ctx, s.Namespace)
+	cs := s.client.ContentStore()
 	info := content.Info{
 		Digest: target.Digest,
 		Labels: map[string]string{name: value},
 	}
 	paths := []string{"labels." + name}
-	_, err = cs.Update(ctx, info, paths...)
+	_, err := cs.Update(ctx, info, paths...)
 	if err != nil {
 		return err
 	}
@@ -372,28 +326,17 @@ func (s *ContainerdStore) Label(ctx context.Context, target ocispec.Descriptor, 
 
 // Delete removes the described content.
 func (s *ContainerdStore) Delete(ctx context.Context, dgst digest.Digest) error {
-	client, err := s.client()
-	if err != nil {
-		return err
-	}
-	cs := client.ContentStore()
+	ctx = namespaces.WithNamespace(ctx, s.Namespace)
+	cs := s.client.ContentStore()
 	return cs.Delete(ctx, dgst)
 }
 
 // BatchOpen creates a lease, ensuring that no content created within the batch will be garbage collected.
 // It returns a cleanup function that ends the lease, which should be called after content is created and labeled.
 func (s *ContainerdStore) BatchOpen(ctx context.Context) (context.Context, CleanupFunc, error) {
-	client, err := s.client()
+	ctx, leaseDone, err := s.client.WithLease(ctx)
 	if err != nil {
-		return ctx, nil, err
-	}
-	ctx, leaseDone, err := client.WithLease(ctx)
-	if err != nil {
-		return ctx, NopCleanup, fmt.Errorf("unable to open batch: %w", err)
+		return ctx, nopCleanup, fmt.Errorf("unable to open batch: %w", err)
 	}
 	return ctx, leaseDone, nil
-}
-
-func (s *ContainerdStore) client() (*containerd.Client, error) {
-	return s.ctdClient.Client()
 }

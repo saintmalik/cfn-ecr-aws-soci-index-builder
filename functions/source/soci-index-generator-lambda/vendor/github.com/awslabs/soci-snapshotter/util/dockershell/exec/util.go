@@ -110,8 +110,6 @@ func NewTempImage(contextDir, targetStage string, opts ...ImageOption) (string, 
 	}
 	if iOpts.patchContextDir != "" {
 		if iOpts.patchDockerfile == "" {
-			// Dockerfile should be capitalized so ignore linter warning here
-			//nolint:staticcheck
 			return "", nil, fmt.Errorf("Dockerfile patch must be specified with context dir")
 		}
 	}

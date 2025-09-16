@@ -1,0 +1,15 @@
+FROM golang:1.23-alpine
+
+RUN apk add --no-cache gcc musl-dev zlib-dev
+
+WORKDIR /app
+COPY . .
+
+RUN go mod download
+RUN rm -f vendor/github.com/awslabs/soci-snapshotter/ztoc/compression/gzip_zinfo.go
+RUN rm -f vendor/github.com/awslabs/soci-snapshotter/ztoc/compression/gzip_zinfo.c
+
+ENV CGO_ENABLED=1
+ENV GOOS=linux
+
+CMD ["go", "run", "handler.go", "test"]

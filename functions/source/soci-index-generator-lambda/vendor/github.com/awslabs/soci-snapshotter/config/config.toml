@@ -15,8 +15,11 @@ http_cache_type=""
 filesystem_cache_type=""
 resolve_result_entry=0
 debug=false
-disable_verification=false
-max_concurrency=0  # Actually zero
+allow_no_verification=true
+# disable_verification=false
+# Causes TestRunWithDefaultConfig to break, but
+# fine to use in /etc/soci-snapshotter-grpc-config.toml
+max_concurrency=0
 no_prometheus=false
 mount_timeout_sec=0
 fuse_metrics_emit_wait_duration_sec=0
@@ -28,20 +31,6 @@ metrics_network="" # Uses default metrics network
 # no_prometheus=true # Defined above, can't be redeclared
 debug_address=""
 metadata_store="db"
-skip_check_snapshotter_supported=false
-
-[pull_modes.parallel_pull_unpack]
-enable=false
-max_concurrent_downloads=-1
-max_concurrent_downloads_per_image=3
-concurrent_download_chunk_size=""
-max_concurrent_unpacks=-1
-max_concurrent_unpacks_per_image=1
-discard_unpacked_layers=false
-
-[pull_modes.parallel_pull_unpack.decompress_streams."gzip"]
-path = "/usr/bin/gzip"
-args = ["-d", "-c"]
 
 [http]
 MaxRetries=0
@@ -50,16 +39,6 @@ MaxWaitMsec=0
 DialTimeoutMsec=0
 ResponseHeaderTimeoutMsec=0
 RequestTimeoutMsec=0
-
-#
-## config/pull_modes.go
-#
-[pull_modes]
-  [pull_modes.soci_v1]
-    enable = false
-
-  [pull_modes.soci_v2]
-    enable = true
 
 #
 ## config/fs.go
@@ -96,7 +75,7 @@ emit_metric_period_sec=0
 
 [content_store]
 type="" # will set to 'soci' by default
-# Socket address for containerd.
+# Socket address for containerd. Only applicable using containerd content store.
 # Defaults to '/run/containerd/containerd.sock'
 containerd_address=""
 namespace="" # will set to 'default' by default

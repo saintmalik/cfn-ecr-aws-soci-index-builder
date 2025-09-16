@@ -44,7 +44,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -59,10 +58,6 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	sociContentRefLabelPrefix = "containerd.io/gc.ref.content.soci-integ-test."
-)
-
 // TestingReporter is an implementation of dockershell.Reporter backed by testing.T and TestingL.
 type TestingReporter struct {
 	t *testing.T
@@ -75,24 +70,14 @@ func NewTestingReporter(t *testing.T) *TestingReporter {
 
 // Errorf prints the provided message to TestingL and stops the test using testing.T.Fatalf.
 func (r *TestingReporter) Errorf(format string, v ...interface{}) {
-	msg := fmt.Sprintf(format, v...)
-	_, file, lineNum, ok := runtime.Caller(2)
-	if ok {
-		r.t.Fatalf("%s:%d: %s", file, lineNum, msg)
-	} else {
-		r.t.Fatalf(format, v...)
-	}
+	TestingL.Printf(format, v...)
+	r.t.Fatalf(format, v...)
 }
 
 // Logf prints the provided message to TestingL testing.T.
 func (r *TestingReporter) Logf(format string, v ...interface{}) {
-	msg := fmt.Sprintf(format, v...)
-	_, file, lineNum, ok := runtime.Caller(2)
-	if ok {
-		r.t.Logf("%s:%d: %s", file, lineNum, msg)
-	} else {
-		r.t.Logf(format, v...)
-	}
+	TestingL.Printf(format, v...)
+	r.t.Logf(format, v...)
 }
 
 // Stdout returns the writer to TestingL as stdout. This enables to print command logs realtime.
@@ -151,9 +136,8 @@ func (m *LogMonitor) scanLog(inputR io.Reader) {
 // RemoteSnapshotMonitor scans log of soci snapshotter and provides the way to check
 // if all snapshots are prepared as remote snpashots.
 type RemoteSnapshotMonitor struct {
-	remote   uint64
-	local    uint64
-	deferred uint64
+	remote uint64
+	local  uint64
 }
 
 // NewRemoteSnapshotMonitor creates a new instance of RemoteSnapshotMonitor and registers it
@@ -164,31 +148,23 @@ func NewRemoteSnapshotMonitor(m *LogMonitor) (*RemoteSnapshotMonitor, func()) {
 	return rsm, func() { m.Remove("remote snapshot") }
 }
 
-type SnapshotPreparedLogLine struct {
-	RemoteSnapshotPrepared    string `json:"remote-snapshot-prepared"`
-	LocalSnapshotPrepared     string `json:"local-snapshot-prepared"`
-	SnapshotDeferredToRuntime string `json:"defer-snapshot-runtime"`
+type RemoteSnapshotPreparedLogLine struct {
+	RemoteSnapshotPrepared string `json:"remote-snapshot-prepared"`
 }
 
 // MonitorFunc counts remote/local snapshot preparation totals
 func (m *RemoteSnapshotMonitor) MonitorFunc(rawL string) {
-	var logline SnapshotPreparedLogLine
+	var logline RemoteSnapshotPreparedLogLine
 	if i := strings.Index(rawL, "{"); i > 0 {
 		rawL = rawL[i:] // trim garbage chars; expects "{...}"-styled JSON log
 	}
 	if err := json.Unmarshal([]byte(rawL), &logline); err == nil {
 		if logline.RemoteSnapshotPrepared == "true" {
 			atomic.AddUint64(&m.remote, 1)
-		} else if logline.LocalSnapshotPrepared == "true" {
+		} else if logline.RemoteSnapshotPrepared == "false" {
 			atomic.AddUint64(&m.local, 1)
-		} else if logline.SnapshotDeferredToRuntime == "true" {
-			atomic.AddUint64(&m.deferred, 1)
 		}
 	}
-}
-
-func getMonitorStr(remote, local, deferred uint64) string {
-	return fmt.Sprintf("(remote:%d,local:%d,deferred:%d)", remote, local, deferred)
 }
 
 // CheckAllRemoteSnapshots checks if the scanned log reports that all snapshots are prepared
@@ -196,79 +172,14 @@ func getMonitorStr(remote, local, deferred uint64) string {
 func (m *RemoteSnapshotMonitor) CheckAllRemoteSnapshots(t *testing.T) {
 	remote := atomic.LoadUint64(&m.remote)
 	local := atomic.LoadUint64(&m.local)
-	deferred := atomic.LoadUint64(&m.deferred)
-	result := getMonitorStr(remote, local, deferred)
-	m.checkExpectedMounts(t, result, remote, "remote")
-	m.checkUnexpectedMounts(t, result, local, "local")
-	m.checkUnexpectedMounts(t, result, deferred, "deferred")
-}
-
-// CheckAllLocalSnapshots checks if the scanned log reports that all snapshots are prepared
-// as local snapshots.
-func (m *RemoteSnapshotMonitor) CheckAllLocalSnapshots(t *testing.T) {
-	remote := atomic.LoadUint64(&m.remote)
-	local := atomic.LoadUint64(&m.local)
-	deferred := atomic.LoadUint64(&m.deferred)
-	result := getMonitorStr(remote, local, deferred)
-	m.checkUnexpectedMounts(t, result, remote, "remote")
-	m.checkExpectedMounts(t, result, local, "local")
-	m.checkUnexpectedMounts(t, result, deferred, "deferred")
-}
-
-// CheckAllDeferredSnapshots checks if the scanned log reports that all snapshots are
-// deferred to container runtime
-func (m *RemoteSnapshotMonitor) CheckAllDeferredSnapshots(t *testing.T) {
-	remote := atomic.LoadUint64(&m.remote)
-	local := atomic.LoadUint64(&m.local)
-	deferred := atomic.LoadUint64(&m.deferred)
-	result := getMonitorStr(remote, local, deferred)
-	m.checkUnexpectedMounts(t, result, remote, "remote")
-	m.checkUnexpectedMounts(t, result, local, "local")
-	m.checkExpectedMounts(t, result, deferred, "deferred")
-}
-
-func (m *RemoteSnapshotMonitor) checkUnexpectedMounts(t *testing.T, result string, count uint64, name string) {
-	if count > 0 {
-		t.Fatalf("some %s snapshots creation have been reported %v", name, result)
-	}
-}
-
-func (m *RemoteSnapshotMonitor) checkExpectedMounts(t *testing.T, result string, count uint64, name string) {
-	if count == 0 {
-		t.Fatalf("no log for checking %s snapshot was provided; Is the log-level = debug?", name)
-	}
-	t.Logf("all layers have been reported as %s snapshots %v", name, result)
-}
-
-const indexDigestMonitorID = "index-digest-monitor"
-
-// IndexDigestMonitor scans the SOCI logs looking for a log that indicates
-// which SOCI index digest was used to pull an image.
-type IndexDigestMonitor struct {
-	IndexDigest string
-	m           *LogMonitor
-}
-
-func NewIndexDigestMonitor(m *LogMonitor) *IndexDigestMonitor {
-	idm := IndexDigestMonitor{
-		m: m,
-	}
-	m.Add(indexDigestMonitorID, idm.process)
-	return &idm
-}
-
-func (idm *IndexDigestMonitor) Close() {
-	idm.m.Remove(indexDigestMonitorID)
-}
-
-func (idm *IndexDigestMonitor) process(s string) {
-	structuredLog := make(map[string]string)
-	err := json.Unmarshal([]byte(s), &structuredLog)
-	if err != nil {
+	result := fmt.Sprintf("(local:%d,remote:%d)", local, remote)
+	if local > 0 {
+		t.Fatalf("some local snapshots creation have been reported %v", result)
+	} else if remote > 0 {
+		t.Logf("all layers have been reported as remote snapshots %v", result)
 		return
-	}
-	if structuredLog["msg"] == "fetching SOCI artifacts using index descriptor" {
-		idm.IndexDigest = structuredLog["digest"]
+	} else {
+		t.Fatalf("no log for checking remote snapshot was provided; Is the log-level = debug?")
 	}
 }
 
@@ -323,39 +234,15 @@ func TempDir(sh *shell.Shell) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-func getNextContentRefNumber(sh *shell.Shell, contentRef string) int {
-	out := sh.O("ctr", "content", "label", contentRef)
-	labels := strings.Split(string(out), ",")
-	maxContentNumber := 0
-	for _, label := range labels {
-		if strings.HasPrefix(label, sociContentRefLabelPrefix) {
-			labelParts := strings.Split(label, "=")
-			if len(labelParts) != 2 {
-				sh.Fatal("failed to parse SOCI content label: %v", label)
-			}
-			contentNumber, err := strconv.Atoi(strings.TrimPrefix(labelParts[0], sociContentRefLabelPrefix))
-			if err != nil {
-				sh.Fatal("failed to parse SOCI content label: %v", err)
-			}
-			if contentNumber > maxContentNumber {
-				maxContentNumber = contentNumber
-			}
-
-		}
-	}
-	return maxContentNumber + 1
-}
-
-func injectContainerdContentStoreContentFromReader(sh *shell.Shell, parentContent string, desc ocispec.Descriptor, content io.Reader) error {
+func injectContainerdContentStoreContentFromReader(sh *shell.Shell, desc ocispec.Descriptor, content io.Reader) error {
 	reference := desc.Digest.String()
-	sh.X("ctr", "content", "label", parentContent, fmt.Sprintf("%s%d=%s", sociContentRefLabelPrefix, getNextContentRefNumber(sh, parentContent), reference))
-
 	cmd := sh.Command("ctr", "content", "ingest", reference)
 	cmd.Stdin = content
 	if err := cmd.Run(); err != nil {
 		return err
 	}
-	return nil
+	cmd = sh.Command("ctr", "content", "label", desc.Digest.String(), "")
+	return cmd.Run()
 }
 
 func injectSociContentStoreContentFromReader(sh *shell.Shell, desc ocispec.Descriptor, content io.Reader) error {
@@ -369,7 +256,7 @@ func injectSociContentStoreContentFromReader(sh *shell.Shell, desc ocispec.Descr
 	return cmd.Run()
 }
 
-func InjectContentStoreContentFromReader(sh *shell.Shell, contentStoreType store.ContentStoreType, parentContent string, desc ocispec.Descriptor, content io.Reader) error {
+func InjectContentStoreContentFromReader(sh *shell.Shell, contentStoreType store.ContentStoreType, desc ocispec.Descriptor, content io.Reader) error {
 	contentStoreType, err := store.CanonicalizeContentStoreType(contentStoreType)
 	if err != nil {
 		return err
@@ -378,15 +265,15 @@ func InjectContentStoreContentFromReader(sh *shell.Shell, contentStoreType store
 	case store.SociContentStoreType:
 		injectSociContentStoreContentFromReader(sh, desc, content)
 	case store.ContainerdContentStoreType:
-		injectContainerdContentStoreContentFromReader(sh, parentContent, desc, content)
+		injectContainerdContentStoreContentFromReader(sh, desc, content)
 	default:
 		return store.ErrUnknownContentStoreType(contentStoreType)
 	}
 	return nil
 }
 
-func InjectContentStoreContentFromBytes(sh *shell.Shell, contentStoreType store.ContentStoreType, parentContent string, desc ocispec.Descriptor, content []byte) error {
-	return InjectContentStoreContentFromReader(sh, contentStoreType, parentContent, desc, bytes.NewReader(content))
+func InjectContentStoreContentFromBytes(sh *shell.Shell, contentStoreType store.ContentStoreType, desc ocispec.Descriptor, content []byte) error {
+	return InjectContentStoreContentFromReader(sh, contentStoreType, desc, bytes.NewReader(content))
 }
 
 func writeFileFromReader(sh *shell.Shell, name string, content io.Reader, mode uint32) error {
@@ -442,9 +329,9 @@ func CopyInDir(sh *shell.Shell, from, to string) error {
 // KillMatchingProcess kills processes that "ps" line matches the specified pattern in the
 // specified execution environment.
 func KillMatchingProcess(sh *shell.Shell, psLinePattern string) error {
-	data, err := sh.Command("ps", "axo", "pid,command").Output()
+	data, err := sh.Command("ps", "auxww").Output()
 	if err != nil {
-		return fmt.Errorf("failed to run ps command: %v", err)
+		return fmt.Errorf("failed to run ps command : %v", err)
 	}
 	var targets []int
 	scanner := bufio.NewScanner(bytes.NewReader(data))
@@ -459,7 +346,7 @@ func KillMatchingProcess(sh *shell.Shell, psLinePattern string) error {
 			if len(es) < 2 {
 				continue
 			}
-			pid, err := strconv.ParseInt(es[0], 10, 32)
+			pid, err := strconv.ParseInt(es[1], 10, 32)
 			if err != nil {
 				continue
 			}
@@ -469,22 +356,11 @@ func KillMatchingProcess(sh *shell.Shell, psLinePattern string) error {
 
 	var allErr error
 	for _, pid := range targets {
-		allErr = errors.Join(allErr, killProcess(sh, pid))
-
-	}
-	return allErr
-}
-
-func killProcess(sh *shell.Shell, pid int) error {
-	// Send SIGTERM so the unit under test correctly writes integration coverage reports to Go coverage directory.
-	ex := sh.Command("kill", "-2", fmt.Sprintf("%d", pid))
-	if out, err := ex.CombinedOutput(); err != nil {
-		// If the process disappeared between the ps and the kill, don't treat it as an error
-		if !strings.Contains(string(out), "No such process") {
-			return err
+		if err := sh.Command("kill", "-9", fmt.Sprintf("%d", pid)).Run(); err != nil {
+			errors.Join(allErr, fmt.Errorf("failed to kill %v: %w", pid, err))
 		}
 	}
-	return nil
+	return allErr
 }
 
 func RemoveContentStoreContent(sh *shell.Shell, contentStoreType store.ContentStoreType, contentDigest string) error {

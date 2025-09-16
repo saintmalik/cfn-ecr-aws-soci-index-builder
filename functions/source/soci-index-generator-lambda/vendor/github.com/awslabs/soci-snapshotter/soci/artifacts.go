@@ -31,10 +31,10 @@ import (
 	"github.com/awslabs/soci-snapshotter/soci/store"
 	"github.com/awslabs/soci-snapshotter/util/dbutil"
 	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
-	"github.com/containerd/errdefs"
+	"github.com/containerd/containerd/platforms"
 	"github.com/containerd/log"
-	"github.com/containerd/platforms"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	bolt "go.etcd.io/bbolt"
@@ -72,7 +72,6 @@ var (
 	bucketKeyLocation       = []byte("location")
 	bucketKeyType           = []byte("type")
 	bucketKeyMediaType      = []byte("media_type")
-	bucketKeyArtifactType   = []byte("artifact_type")
 	bucketKeyCreatedAt      = []byte("created_at")
 
 	// ArtifactEntryTypeIndex indicates that an ArtifactEntry is a SOCI index artifact
@@ -89,11 +88,8 @@ var (
 )
 
 // Get the default artifacts db path
-func ArtifactsDbPath(root string) string {
-	if root == "" {
-		root = config.DefaultSociSnapshotterRootPath
-	}
-	return path.Join(root, artifactsDbName)
+func ArtifactsDbPath() string {
+	return path.Join(config.SociSnapshotterRootPath, artifactsDbName)
 }
 
 // ArtifactEntry is a metadata object for a SOCI artifact.
@@ -116,8 +112,6 @@ type ArtifactEntry struct {
 	Type ArtifactEntryType
 	// Media Type of the stored artifact.
 	MediaType string
-	// ArtifactType is the type of artifact stored (e.g. index manifest v1 vs index manifest v2)
-	ArtifactType string
 	// Creation time of SOCI artifact.
 	CreatedAt time.Time
 }
@@ -127,20 +121,20 @@ func NewDB(path string) (*ArtifactsDb, error) {
 	once.Do(func() {
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 		if err != nil {
-			log.G(context.Background()).WithError(err).WithField("path", path).Error("Cannot create or open file")
+			log.G(context.Background()).Errorf("can't create or open the file %s", path)
 			return
 		}
 		defer f.Close()
 		database, err := bolt.Open(f.Name(), 0600, nil)
 		if err != nil {
-			log.G(context.Background()).WithError(err).Error("Cannot open the db")
+			log.G(context.Background()).Errorf("can't open the db")
 			return
 		}
 		db = &ArtifactsDb{db: database}
 	})
 
 	if db == nil {
-		return nil, errors.New("artifacts.db is not available")
+		return nil, fmt.Errorf("artifacts.db is not available")
 	}
 
 	return db, nil
@@ -181,7 +175,7 @@ func (db *ArtifactsDb) Walk(f func(*ArtifactEntry) error) error {
 
 // SyncWithLocalStore will sync the artifacts databse with SOCIs local content store, either adding new or removing old artifacts.
 func (db *ArtifactsDb) SyncWithLocalStore(ctx context.Context, blobStore store.Store, blobStorePath string, cs content.Store) error {
-	if err := db.RemoveOldArtifacts(ctx, blobStore); err != nil {
+	if err := db.RemoveOldArtifacts(blobStore); err != nil {
 		return fmt.Errorf("failed to remove old artifacts from db: %w", err)
 	}
 	if err := db.addNewArtifacts(ctx, blobStorePath, cs); err != nil {
@@ -195,7 +189,7 @@ func (db *ArtifactsDb) SyncWithLocalStore(ctx context.Context, blobStore store.S
 // (bucket.ForEach) causes unexpected behavior (see: https://github.com/boltdb/bolt/issues/426).
 // This implementation works around this issue by appending buckets to a slice when
 // iterating and removing them after.
-func (db *ArtifactsDb) RemoveOldArtifacts(ctx context.Context, blobStore store.Store) error {
+func (db *ArtifactsDb) RemoveOldArtifacts(blobStore store.Store) error {
 	err := db.db.Update(func(tx *bolt.Tx) error {
 		bucket, err := getArtifactsBucket(tx)
 		if err != nil {
@@ -208,7 +202,7 @@ func (db *ArtifactsDb) RemoveOldArtifacts(ctx context.Context, blobStore store.S
 			if err != nil {
 				return err
 			}
-			existsInContentStore, err := blobStore.Exists(ctx,
+			existsInContentStore, err := blobStore.Exists(context.Background(),
 				ocispec.Descriptor{MediaType: ae.MediaType, Digest: digest.Digest(ae.Digest)})
 			if err != nil {
 				return err
@@ -296,7 +290,6 @@ func (db *ArtifactsDb) addNewArtifacts(ctx context.Context, blobStorePath string
 				Type:           ArtifactEntryTypeIndex,
 				Location:       manifestDigest,
 				MediaType:      sociIndex.MediaType,
-				ArtifactType:   sociIndex.Config.MediaType,
 				CreatedAt:      time.Now(),
 			}
 			if err = db.WriteArtifactEntry(indexEntry); err != nil {
@@ -323,22 +316,24 @@ func (db *ArtifactsDb) addNewArtifacts(ctx context.Context, blobStorePath string
 
 // GetArtifactEntry loads a single ArtifactEntry from the ArtifactsDB by digest
 func (db *ArtifactsDb) GetArtifactEntry(digest string) (*ArtifactEntry, error) {
-	var entry *ArtifactEntry
+	entry := ArtifactEntry{}
 	err := db.db.View(func(tx *bolt.Tx) error {
-		var err error
-		entry, err = db.getArtifactEntry(tx, digest)
-		return err
+		bucket, err := getArtifactsBucket(tx)
+		if err != nil {
+			return err
+		}
+		e, err := getArtifactEntryByDigest(bucket, digest)
+		if err != nil {
+			return err
+		}
+		entry = *e
+		return nil
 	})
 
-	return entry, err
-}
-
-func (db *ArtifactsDb) getArtifactEntry(tx *bolt.Tx, digest string) (*ArtifactEntry, error) {
-	bucket, err := getArtifactsBucket(tx)
 	if err != nil {
 		return nil, err
 	}
-	return getArtifactEntryByDigest(bucket, digest)
+	return &entry, nil
 }
 
 // GetArtifactType gets Type of an ArtifactEntry from the ArtifactsDB by digest
@@ -360,13 +355,13 @@ func (db *ArtifactsDb) RemoveArtifactEntryByIndexDigest(digest []byte) error {
 
 		dgstBucket := bucket.Bucket(digest)
 		if dgstBucket == nil {
-			return fmt.Errorf("the index of the digest %s doesn't exist", digest)
+			return fmt.Errorf("the index of the digest %v doesn't exist", digest)
 		}
 
 		if indexBucket(dgstBucket) {
 			return bucket.DeleteBucket(digest)
 		}
-		return fmt.Errorf("the digest %s does not correspond to an index", digest)
+		return fmt.Errorf("the digest %v does not correspond to an index", digest)
 	})
 }
 
@@ -409,32 +404,15 @@ func (db *ArtifactsDb) WriteArtifactEntry(entry *ArtifactEntry) error {
 	if entry == nil {
 		return fmt.Errorf("no entry to write")
 	}
-	return db.db.Update(func(tx *bolt.Tx) error {
-		return db.writeArtifactEntry(tx, entry)
-	})
-}
-
-func (db *ArtifactsDb) writeArtifactEntry(tx *bolt.Tx, entry *ArtifactEntry) error {
-	bucket, err := tx.CreateBucketIfNotExists(bucketKeySociArtifacts)
-	if err != nil {
-		return err
-	}
-	return putArtifactEntry(bucket, entry)
-}
-
-// updateSociV2ArtifactReference updates the image and manifest digests associated with the SOCI index digest in the artifacts db.
-// the indexDigest is the SOCI index to updated, the manifestDigest is the specific image manifest that the SOCI index is bound to,
-// and the imageDigest is the target of the image (this is the same as the manifestDigest for single platform images, but different for mult-platform)
-func (db *ArtifactsDb) updateSociV2ArtifactReference(indexDigest string, manifestDigest string, imageDigest string) error {
-	return db.db.Update(func(tx *bolt.Tx) error {
-		ae, err := db.getArtifactEntry(tx, indexDigest)
+	err := db.db.Update(func(tx *bolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(bucketKeySociArtifacts)
 		if err != nil {
 			return err
 		}
-		ae.ImageDigest = imageDigest
-		ae.OriginalDigest = manifestDigest
-		return db.writeArtifactEntry(tx, ae)
+		err = putArtifactEntry(bucket, entry)
+		return err
 	})
+	return err
 }
 
 func getArtifactsBucket(tx *bolt.Tx) (*bolt.Bucket, error) {
@@ -476,7 +454,6 @@ func loadArtifact(artifactBkt *bolt.Bucket, digest string) (*ArtifactEntry, erro
 	ae.ImageDigest = string(artifactBkt.Get(bucketKeyImageDigest))
 	ae.Platform = string(artifactBkt.Get(bucketKeyPlatform))
 	ae.MediaType = string(artifactBkt.Get(bucketKeyMediaType))
-	ae.ArtifactType = string(artifactBkt.Get(bucketKeyArtifactType))
 	ae.CreatedAt = createdAt
 	return &ae, nil
 }
@@ -512,7 +489,6 @@ func putArtifactEntry(artifacts *bolt.Bucket, ae *ArtifactEntry) error {
 		{bucketKeyPlatform, []byte(ae.Platform)},
 		{bucketKeyType, []byte(ae.Type)},
 		{bucketKeyMediaType, []byte(ae.MediaType)},
-		{bucketKeyArtifactType, []byte(ae.ArtifactType)},
 		{bucketKeyCreatedAt, createdAt},
 	}
 

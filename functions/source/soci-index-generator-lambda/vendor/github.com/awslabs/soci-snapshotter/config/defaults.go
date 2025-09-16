@@ -41,17 +41,11 @@ package config
 // Config (root) defaults
 const (
 	defaultMetricsNetwork = "tcp"
-	defaultMetadataStore  = "db"
 )
 
 // ServiceConfig defaults
 const (
 	DefaultImageServiceAddress = "/run/containerd/containerd.sock"
-)
-
-// ParallelPullUnpack defaults
-const (
-	Unbounded = -1
 )
 
 // FSConfig defaults
@@ -92,7 +86,7 @@ const (
 	// defaultResponseHeaderTimeoutMsec is the default number of milliseconds before timeout while waiting for response header from a remote endpoint. See `TimeoutConfig.ResponseHeaderTimeout`.
 	defaultResponseHeaderTimeoutMsec = 3_000
 	// defaultRequestTimeoutMsec is the default number of milliseconds that the entire request can take before timeout. See `TimeoutConfig.RequestTimeout`.
-	defaultRequestTimeoutMsec = 300_000
+	defaultRequestTimeoutMsec = 30_000
 
 	// defaults based on a target total retry time of at least 5s. 30*((2^8)-1)>5000
 
@@ -104,33 +98,5 @@ const (
 	defaultMaxWaitMsec = 300_000
 
 	// DefaultContentStore chooses the soci or containerd content store as the default
-	DefaultContentStoreType = "containerd"
-
-	// DefaultSOCIV1Enable is the default value for whether SOCI v1 is enabled
-	DefaultSOCIV1Enable = false
-
-	// DefaultSOCIV2Enable is the default value for whether SOCI v2 is enabled
-	DefaultSOCIV2Enable = true
-
-	// DefaultParallelPullEnable is the default value for whether parallel pull and unpack is enabled
-	DefaultParallelPullUnpackEnable = false
-
-	// Defaults for ParallelPullUnpack.
-	// The default values should mirror default containerd values.
-
-	// defaultMaxConcurrentDownloads sets the default value for how many reads can be done over the network at a time.
-	defaultMaxConcurrentDownloads = Unbounded
-	// defaultMaxConcurrentDownloadsPerImage sets the default value for how many reads a single image can do over the network at a time.
-	// This must be less than or equal to MaxConcurrentDownloads.
-	defaultMaxConcurrentDownloadsPerImage = 3
-
-	// defaultConcurrentDownloadChunkSize sets the default value for the max size, in bytes, of downloaded content per network read.
-	// When unbounded, full layer is downloaded in one request
-	defaultConcurrentDownloadChunkSize = Unbounded
-
-	// defaultMaxConcurrentUnpacks sets the default value for the max number of layers that will be unpacked at once.
-	defaultMaxConcurrentUnpacks = Unbounded
-	// defaultMaxConcurrentUnpacks sets the default value for the max number of layers per image that will be unpacked at once.
-	// This must be less than or equal to MaxConcurrentUnpacks.
-	defaultMaxConcurrentUnpacksPerImage = 1
+	DefaultContentStoreType = "soci"
 )

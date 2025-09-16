@@ -35,10 +35,6 @@ package config
 type ServiceConfig struct {
 	FSConfig
 
-	// PullModes controls which pull modes are enabled
-	// and their implementation-specific config
-	PullModes PullModes `toml:"pull_modes"`
-
 	// KubeconfigKeychainConfig is config for kubeconfig-based keychain.
 	KubeconfigKeychainConfig `toml:"kubeconfig_keychain"`
 
@@ -83,9 +79,8 @@ type SnapshotterConfig struct {
 	AllowInvalidMountsOnRestart bool `toml:"allow_invalid_mounts_on_restart"`
 }
 
-func parseServiceConfig(cfg *Config) error {
+func parseServiceConfig(cfg *Config) {
 	if cfg.CRIKeychainConfig.ImageServicePath == "" {
 		cfg.CRIKeychainConfig.ImageServicePath = DefaultImageServiceAddress
 	}
-	return nil
 }
