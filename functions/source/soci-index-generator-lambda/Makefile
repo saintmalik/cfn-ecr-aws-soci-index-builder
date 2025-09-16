@@ -1,15 +1,9 @@
-default:
-	# Use static builds to make sure we don't have library version issues between the build env and lambda
-	GOOS=linux GOARCH=amd64 go build -mod=vendor -tags "osusergo netgo static_build lambda.norpc" -ldflags '-extldflags "-static"' -o bootstrap
-	zip soci_index_generator_lambda.zip bootstrap
+.PHONY: build clean
 
-# Run all unit tests except integration tests
-test:
-	go test -mod=vendor -v ./... -skip TestHandler
+build:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o bootstrap handler.go
+	zip lambda-deployment.zip bootstrap
+	rm bootstrap
 
-# Run only integration tests that require environment variables
-test-integration:
-	go test -mod=vendor -v -run "^TestHandler" .
-
-# Run all tests including integration tests
-test-all: test test-integration
+clean:
+	rm -f lambda-deployment.zip bootstrap

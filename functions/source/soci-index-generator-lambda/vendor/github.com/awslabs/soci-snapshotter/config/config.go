@@ -42,15 +42,14 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/pelletier/go-toml/v2"
+	"github.com/pelletier/go-toml"
 )
 
 const (
-	// DefaultSociSnapshotterRootPath is the default filesystem path for the snapshotter root directory.
-	DefaultSociSnapshotterRootPath = "/var/lib/soci-snapshotter-grpc/"
+	// Default path to snapshotter root dir
+	SociSnapshotterRootPath = "/var/lib/soci-snapshotter-grpc/"
 
-	// DefaultConfigPath is the default filesystem path for the snapshotter configuration file.
-	DefaultConfigPath = "/etc/soci-snapshotter-grpc/config.toml"
+	defaultConfigPath = "/etc/soci-snapshotter-grpc/config.toml"
 )
 
 type Config struct {
@@ -69,59 +68,31 @@ type Config struct {
 	DebugAddress string `toml:"debug_address"`
 
 	// MetadataStore is the type of the metadata store to use.
-	MetadataStore string `toml:"metadata_store"`
-
-	// SkipCheckSnapshotterSupported is a flag to skip check for overlayfs support needed to confirm if SOCI can work
-	SkipCheckSnapshotterSupported bool `toml:"skip_check_snapshotter_supported"`
+	MetadataStore string `toml:"metadata_store" default:"db"`
 }
-type configParser func(*Config) error
-
-var parsers = []configParser{parseRootConfig, parseServiceConfig, parseFSConfig, parseParallelConfig}
-
-// NewConfig returns an initialized Config with default values set.
-func NewConfig() *Config {
-	cfg := &Config{}
-
-	// Set any defaults which do not align with Go zero values.
-	var initParsers = []configParser{defaultPullModes, defaultDirectoryCacheConfig}
-	for _, p := range append(initParsers, parsers...) {
-		p(cfg)
-	}
-
-	return cfg
-}
+type configParser func(*Config)
 
 func NewConfigFromToml(cfgPath string) (*Config, error) {
-	f, err := os.Open(cfgPath)
-	if err != nil {
-		if os.IsNotExist(err) && cfgPath == DefaultConfigPath {
-			return NewConfig(), nil
-		}
-		return nil, fmt.Errorf("failed to open config file %q: %w", cfgPath, err)
-	}
-	defer f.Close()
-
-	cfg := NewConfig()
+	cfg := &Config{}
 	// Get configuration from specified file
-	if err = toml.NewDecoder(f).Decode(cfg); err != nil {
-		return nil, fmt.Errorf("failed to load config file %q: %w", cfgPath, err)
+	tree, err := toml.LoadFile(cfgPath)
+	if err != nil && !(os.IsNotExist(err) && cfgPath == defaultConfigPath) {
+		return nil, fmt.Errorf("failed to load config file %q", cfgPath)
 	}
-	parseConfig(cfg)
-	return cfg, nil
-}
+	if err := tree.Unmarshal(cfg); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config file %q", cfgPath)
+	}
+	parsers := []configParser{parseRootConfig, parseServiceConfig, parseFSConfig}
 
-func parseConfig(cfg *Config) {
 	for _, p := range parsers {
 		p(cfg)
 	}
+
+	return cfg, nil
 }
 
-func parseRootConfig(cfg *Config) error {
+func parseRootConfig(cfg *Config) {
 	if cfg.MetricsNetwork == "" {
 		cfg.MetricsNetwork = defaultMetricsNetwork
 	}
-	if cfg.MetadataStore == "" {
-		cfg.MetadataStore = defaultMetadataStore
-	}
-	return nil
 }

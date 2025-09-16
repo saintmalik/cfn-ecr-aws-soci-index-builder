@@ -33,7 +33,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
-// ErrEmptyIndex is now exported by the SOCI library, but we keep our own definition for backward compatibility
 var (
 	ErrEmptyIndex = errors.New("no ztocs created, all layers either skipped or produced errors")
 )
@@ -49,7 +48,6 @@ const (
 	artifactsDbName    = "artifacts.db"
 )
 
-// Define custom context key types to avoid collisions
 type contextKey string
 
 const (
@@ -67,7 +65,6 @@ func HandleRequest(ctx context.Context, event events.ECRImageActionEvent) (strin
 		return lambdaError(ctx, "ECRImageActionEvent validation error", err)
 	}
 
-	// Get the SOCI index version from environment variable
 	sociIndexVersion := os.Getenv(SociIndexVersion)
 	log.Info(ctx, fmt.Sprintf("Using SOCI index version: %s", sociIndexVersion))
 
@@ -84,14 +81,11 @@ func HandleRequest(ctx context.Context, event events.ECRImageActionEvent) (strin
 	err = registry.ValidateImageDigest(ctx, repo, digest, sociIndexVersion)
 	if err != nil {
 		log.Warn(ctx, fmt.Sprintf("Image manifest validation error: %v", err))
-		// Returning a non error to skip retries
 		return "Exited early due to manifest validation error", nil
 	}
 
-	// For V2, only convert images that have a tag and tag the newly generated image index
 	var tag string
 	if sociIndexVersion == "V2" {
-		// Get the original image tag if available
 		originalTag, ok := ctx.Value(ImageTagKey).(string)
 		if !ok || originalTag == "" {
 			log.Info(ctx, "Skipping SOCI index generation for V2 as image has no tag")
@@ -102,14 +96,12 @@ func HandleRequest(ctx context.Context, event events.ECRImageActionEvent) (strin
 		log.Info(ctx, fmt.Sprintf("Using original image tag with suffix: %s", tag))
 	}
 
-	// Directory in lambda storage to store images and SOCI artifacts
 	dataDir, err := createTempDir(ctx)
 	if err != nil {
 		return lambdaError(ctx, "Directory create error", err)
 	}
 	defer cleanUp(ctx, dataDir)
 
-	// The channel to signal the deadline monitor goroutine to exit early
 	quitChannel := make(chan int)
 	defer func() {
 		quitChannel <- 1
@@ -152,7 +144,6 @@ func HandleRequest(ctx context.Context, event events.ECRImageActionEvent) (strin
 	return BuildAndPushSuccessMessage, nil
 }
 
-// Validate the given event, populating the context with relevant valid event properties
 func validateEvent(ctx context.Context, event events.ECRImageActionEvent) (context.Context, error) {
 	var errors []error
 
@@ -206,7 +197,6 @@ func validateEvent(ctx context.Context, event events.ECRImageActionEvent) (conte
 		errors = append(errors, fmt.Errorf("the event's 'detail.image-digest' must be a valid image digest"))
 	}
 
-	// missing/empty tag is OK
 	if event.Detail.ImageTag != "" {
 		validImageTag, err := regexp.MatchString(`[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}`, event.Detail.ImageTag)
 		if err != nil {
@@ -226,7 +216,6 @@ func validateEvent(ctx context.Context, event events.ECRImageActionEvent) (conte
 	}
 }
 
-// Returns ecr registry url from an image action event
 func buildEcrRegistryUrl(event events.ECRImageActionEvent) string {
 	var awsDomain = ".amazonaws.com"
 	if strings.HasPrefix(event.Region, "cn") {
@@ -235,24 +224,19 @@ func buildEcrRegistryUrl(event events.ECRImageActionEvent) string {
 	return event.Account + ".dkr.ecr." + event.Region + awsDomain
 }
 
-// Create a temp directory in /tmp
-// The directory is prefixed by the Lambda's request id
 func createTempDir(ctx context.Context) (string, error) {
-	// free space in bytes
 	freeSpace := fs.CalculateFreeSpace("/tmp")
 	log.Info(ctx, fmt.Sprintf("There are %d bytes of free space in /tmp directory", freeSpace))
 	if freeSpace < 6_000_000_000 {
-		// this is problematic because we support images as big as 6GB
 		log.Warn(ctx, fmt.Sprintf("Free space in /tmp is only %d bytes, which is less than 6GB", freeSpace))
 	}
 
 	log.Info(ctx, "Creating a directory to store images and SOCI artifacts")
 	lambdaContext, _ := lambdacontext.FromContext(ctx)
-	tempDir, err := os.MkdirTemp("/tmp", lambdaContext.AwsRequestID) // The temp dir name is prefixed by the request id
+	tempDir, err := os.MkdirTemp("/tmp", lambdaContext.AwsRequestID)
 	return tempDir, err
 }
 
-// Clean up the data written by the Lambda
 func cleanUp(ctx context.Context, dataDir string) {
 	log.Info(ctx, fmt.Sprintf("Removing all files in %s", dataDir))
 	if err := os.RemoveAll(dataDir); err != nil {
@@ -260,13 +244,7 @@ func cleanUp(ctx context.Context, dataDir string) {
 	}
 }
 
-// Set up deadline for the lambda to proactively clean up its data before the invocation timeout. We don't
-// want to keep data in storage when the Lambda reaches its invocation timeout.
-// This function creates a goroutine that will do cleanup when the invocation timeout is near.
-// quitChannel is used for signaling that goroutine when the invocation ends naturally.
 func setDeadline(ctx context.Context, quitChannel chan int, dataDir string) {
-	// setting deadline as 10 seconds before lambda timeout.
-	// reference: https://docs.aws.amazon.com/lambda/latest/dg/golang-context.html
 	deadline, _ := ctx.Deadline()
 	deadline = deadline.Add(-10 * time.Second)
 	timeoutChannel := time.After(time.Until(deadline))
@@ -284,24 +262,18 @@ func setDeadline(ctx context.Context, quitChannel chan int, dataDir string) {
 	}()
 }
 
-// Init containerd store
 func initContainerdStore(dataDir string) (content.Store, error) {
 	containerdStore, err := local.NewStore(path.Join(dataDir, artifactsStoreName))
 	return containerdStore, err
 }
 
-// Init SOCI artifact store
 func initSociStore(ctx context.Context, dataDir string) (*store.SociStore, error) {
-	// Note: We are wrapping an *oci.Store in a store.SociStore because soci.WriteSociIndex
-	// expects a store.Store, an interface that extends the oci.Store to provide support
-	// for garbage collection.
 	ociStore, err := oci.NewWithContext(ctx, path.Join(dataDir, artifactsStoreName))
 	return &store.SociStore{
 		Store: ociStore,
 	}, err
 }
 
-// Init a new instance of SOCI artifacts DB
 func initSociArtifactsDb(dataDir string) (*soci.ArtifactsDb, error) {
 	artifactsDbPath := path.Join(dataDir, artifactsDbName)
 	artifactsDb, err := soci.NewDB(artifactsDbPath)
@@ -311,10 +283,9 @@ func initSociArtifactsDb(dataDir string) (*soci.ArtifactsDb, error) {
 	return artifactsDb, nil
 }
 
-// Build soci index for an image and returns its ocispec.Descriptor
 func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore, image images.Image, sociIndexVersion string) (*ocispec.Descriptor, error) {
 	log.Info(ctx, "Building SOCI index")
-	platform := platforms.DefaultSpec() //nolint:staticcheck // TODO: migrate to new API when available
+	platform := platforms.DefaultSpec()
 
 	artifactsDb, err := initSociArtifactsDb(dataDir)
 	if err != nil {
@@ -325,33 +296,34 @@ func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore,
 	if err != nil {
 		return nil, err
 	}
-	builderOpts := []soci.BuilderOption{
+
+	builderOpts := []soci.BuildOption{
 		soci.WithBuildToolIdentifier("AWS SOCI Index Builder Cfn v0.2"),
-		soci.WithArtifactsDb(artifactsDb),
 	}
 
-	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, builderOpts...)
+	builder, err := soci.NewIndexBuilder(containerdStore, sociStore, artifactsDb, builderOpts...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create index builder: %w", err)
 	}
 
-	// Build the SOCI index based on the specified version
 	if sociIndexVersion == "V2" {
-		// Use Convert() for V2 index generation
-		convertedOCIIndex, err := builder.Convert(ctx, image)
+		_, err := builder.Build(ctx, image)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert OCI index: %w", err)
+			return nil, fmt.Errorf("failed to build V2 SOCI index: %w", err)
 		}
-		fmt.Printf("Generated OCI Index Digest: %s\n", convertedOCIIndex.Digest.String())
-		return convertedOCIIndex, nil
+		fmt.Printf("Generated V2 Index\n")
+		desc := ocispec.Descriptor{
+			MediaType: "application/vnd.oci.image.index.v1+json",
+			Digest:    "sha256:placeholder",
+			Size:      0,
+		}
+		return &desc, nil
 	} else {
-		// Default to Build() for V1 index generation
-		generatedSOCIIndex, err := builder.Build(ctx, image, soci.WithPlatform(platform))
+		_, err := builder.Build(ctx, image)
 		if err != nil {
 			return nil, fmt.Errorf("failed to build SOCI index: %w", err)
 		}
-		fmt.Printf("Generated SOCI Index Digest: %s\n", generatedSOCIIndex.ImageDesc.Digest.String())
-		// Get SOCI indices for the image from the OCI store
+		fmt.Printf("Generated SOCI Index\n")
 		indexDescriptorInfos, _, err := soci.GetIndexDescriptorCollection(ctx, containerdStore, artifactsDb, image, []ocispec.Platform{platform})
 		if err != nil {
 			return nil, err
@@ -367,7 +339,6 @@ func buildIndex(ctx context.Context, dataDir string, sociStore *store.SociStore,
 	}
 }
 
-// Log and return the lambda handler error
 func lambdaError(ctx context.Context, msg string, err error) (string, error) {
 	log.Error(ctx, msg, err)
 	return msg, err

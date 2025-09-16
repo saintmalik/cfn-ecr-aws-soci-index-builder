@@ -42,6 +42,7 @@ import (
 	"strings"
 
 	"github.com/containerd/containerd/defaults"
+	"github.com/containerd/containerd/namespaces"
 )
 
 type FSConfig struct {
@@ -49,6 +50,7 @@ type FSConfig struct {
 	FSCacheType                    string `toml:"filesystem_cache_type"`
 	ResolveResultEntry             int    `toml:"resolve_result_entry"`
 	Debug                          bool   `toml:"debug"`
+	AllowNoVerification            bool   `toml:"allow_no_verification"`
 	DisableVerification            bool   `toml:"disable_verification"`
 	MaxConcurrency                 int64  `toml:"max_concurrency"`
 	NoPrometheus                   bool   `toml:"no_prometheus"`
@@ -87,12 +89,7 @@ type DirectoryCacheConfig struct {
 	MaxLRUCacheEntry int  `toml:"max_lru_cache_entry"`
 	MaxCacheFds      int  `toml:"max_cache_fds"`
 	SyncAdd          bool `toml:"sync_add"`
-	Direct           bool `toml:"direct"`
-}
-
-func defaultDirectoryCacheConfig(cfg *Config) error {
-	cfg.FSConfig.DirectoryCacheConfig.Direct = true
-	return nil
+	Direct           bool `toml:"direct" default:"true"`
 }
 
 type FuseConfig struct {
@@ -171,10 +168,6 @@ const (
 	SociContentStoreType       ContentStoreType = "soci"
 )
 
-func TrimSocketAddress(address string) string {
-	return strings.TrimPrefix(address, "unix://")
-}
-
 // ContentStoreConfig chooses and configures the content store
 type ContentStoreConfig struct {
 	Type ContentStoreType `toml:"type"`
@@ -182,9 +175,11 @@ type ContentStoreConfig struct {
 	// ContainerdAddress is the containerd socket address.
 	// Applicable if and only if using containerd content store.
 	ContainerdAddress string `toml:"containerd_address"`
+
+	Namespace string `toml:"namespace"`
 }
 
-func parseFSConfig(cfg *Config) error {
+func parseFSConfig(cfg *Config) {
 	// Parse top level fs config
 	if cfg.MountTimeoutSec == 0 {
 		cfg.MountTimeoutSec = defaultMountTimeoutSec
@@ -202,14 +197,11 @@ func parseFSConfig(cfg *Config) error {
 	// Parse nested fs configs
 	parsers := []configParser{parseFuseConfig, parseBackgroundFetchConfig, parseRetryableHTTPClientConfig, parseBlobConfig, parseContentStoreConfig}
 	for _, p := range parsers {
-		if err := p(cfg); err != nil {
-			return err
-		}
+		p(cfg)
 	}
-	return nil
 }
 
-func parseFuseConfig(cfg *Config) error {
+func parseFuseConfig(cfg *Config) {
 	if cfg.FuseConfig.AttrTimeout == 0 {
 		cfg.FuseConfig.AttrTimeout = defaultFuseTimeoutSec
 	}
@@ -221,10 +213,9 @@ func parseFuseConfig(cfg *Config) error {
 	if cfg.FuseConfig.NegativeTimeout == 0 {
 		cfg.FuseConfig.NegativeTimeout = defaultFuseTimeoutSec
 	}
-	return nil
 }
 
-func parseBackgroundFetchConfig(cfg *Config) error {
+func parseBackgroundFetchConfig(cfg *Config) {
 	if cfg.BackgroundFetchConfig.FetchPeriodMsec == 0 {
 		cfg.BackgroundFetchConfig.FetchPeriodMsec = defaultBgFetchPeriodMsec
 	}
@@ -239,10 +230,9 @@ func parseBackgroundFetchConfig(cfg *Config) error {
 	if cfg.BackgroundFetchConfig.EmitMetricPeriodSec == 0 {
 		cfg.BackgroundFetchConfig.EmitMetricPeriodSec = defaultBgMetricEmitPeriodSec
 	}
-	return nil
 }
 
-func parseRetryableHTTPClientConfig(cfg *Config) error {
+func parseRetryableHTTPClientConfig(cfg *Config) {
 	if cfg.RetryableHTTPClientConfig.TimeoutConfig.DialTimeoutMsec == 0 {
 		cfg.RetryableHTTPClientConfig.TimeoutConfig.DialTimeoutMsec = defaultDialTimeoutMsec
 	}
@@ -266,10 +256,9 @@ func parseRetryableHTTPClientConfig(cfg *Config) error {
 	if cfg.RetryableHTTPClientConfig.RetryConfig.MaxWaitMsec == 0 {
 		cfg.RetryableHTTPClientConfig.RetryConfig.MaxWaitMsec = defaultMaxWaitMsec
 	}
-	return nil
 }
 
-func parseBlobConfig(cfg *Config) error {
+func parseBlobConfig(cfg *Config) {
 	if cfg.BlobConfig.ValidInterval == 0 {
 		cfg.BlobConfig.ValidInterval = defaultValidIntervalSec
 	}
@@ -288,19 +277,17 @@ func parseBlobConfig(cfg *Config) error {
 	if cfg.BlobConfig.MaxWaitMsec == 0 {
 		cfg.BlobConfig.MaxWaitMsec = cfg.RetryableHTTPClientConfig.RetryConfig.MaxWaitMsec
 	}
-	return nil
 }
 
-func parseContentStoreConfig(cfg *Config) error {
+func parseContentStoreConfig(cfg *Config) {
 	if cfg.ContentStoreConfig.Type == "" {
-		// We are intentionally not using containerd as the default content store until we do more testing.
-		// Until we are confident, use the SOCI store instead.
-		cfg.ContentStoreConfig.Type = SociContentStoreType
-	}
-	if cfg.ContentStoreConfig.ContainerdAddress == "" {
+		cfg.ContentStoreConfig.Type = DefaultContentStoreType
+	} else if cfg.ContentStoreConfig.Type == ContainerdContentStoreType && cfg.ContentStoreConfig.ContainerdAddress == "" {
 		cfg.ContentStoreConfig.ContainerdAddress = defaults.DefaultAddress
-	} else {
-		cfg.ContentStoreConfig.ContainerdAddress = TrimSocketAddress(cfg.ContentStoreConfig.ContainerdAddress)
+	} else if cfg.ContentStoreConfig.Type == ContainerdContentStoreType {
+		cfg.ContentStoreConfig.ContainerdAddress = strings.TrimPrefix(cfg.ContentStoreConfig.ContainerdAddress, "unix://")
 	}
-	return nil
+	if cfg.ContentStoreConfig.Namespace == "" {
+		cfg.ContentStoreConfig.Namespace = namespaces.Default
+	}
 }
